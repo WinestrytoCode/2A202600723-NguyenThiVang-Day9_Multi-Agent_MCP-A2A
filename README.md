@@ -217,3 +217,177 @@ The `docs/` folder contains SVG architecture diagrams:
 | `08_a2a_core_concepts` | A2A core concepts (Agent Cards, Tasks, Parts) |
 | `09_a2a_interaction_flow` | A2A interaction flow patterns |
 | `10_llm_roadmap` | LLM evolution roadmap (Stages 1–5) |
+
+---
+
+## Hướng dẫn Setup & Báo cáo Thực hành (Lab Report)
+
+### 1. Hướng dẫn Setup & Khởi chạy hệ thống A2A Multi-Agent (Stage 5)
+Để chạy hệ thống Agent-to-Agent đầy đủ mà không gặp lỗi Timeout hoặc lỗi số dư tài khoản từ OpenRouter, thực hiện các bước cấu hình sau:
+
+#### Bước 1: Cấu hình Môi trường (`.env`)
+Sử dụng mô hình `google/gemini-2.5-flash` để đảm bảo phản hồi cực nhanh (~10s thay vì >3 phút như Gemma):
+```env
+OPENROUTER_API_KEY=your_key_here
+OPENROUTER_MODEL=google/gemini-2.5-flash
+REGISTRY_URL=http://localhost:10000
+```
+
+#### Bước 2: Phân quyền thực thi cho các file script
+Cấp quyền chạy script khởi động:
+```bash
+chmod +x start_all.sh
+```
+
+#### Bước 3: Cấu hình LLM Client (`common/llm.py`)
+Đảm bảo thêm giới hạn `max_tokens=2000` để tránh lỗi `402 Payment Required` đối với tài khoản OpenRouter có số dư thấp:
+```python
+def get_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5"),
+        openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+        openai_api_base="https://openrouter.ai/api/v1",
+        temperature=0.3,
+        max_tokens=2000,
+    )
+```
+
+#### Bước 4: Khởi chạy và Test
+1. Khởi động 5 dịch vụ Agent trong nền:
+   ```bash
+   uv run ./start_all.sh
+   ```
+2. Gửi yêu cầu kiểm tra từ Client:
+   ```bash
+   uv run python test_client.py
+   ```
+3. Dừng tất cả dịch vụ khi hoàn tất:
+   Giải phóng các cổng mạng 10000, 10100-10103:
+   ```bash
+   fuser -k 10000/tcp 10100/tcp 10101/tcp 10102/tcp 10103/tcp
+   ```
+
+---
+
+### 2. Báo cáo Kết quả Thực hành Codelab
+
+#### A. Tìm hiểu LLM & Tool Binding (Stage 1 & 2)
+* **Khởi tạo LLM:** Class `ChatOpenAI` được trỏ tới đầu cuối OpenRouter API. Việc phân tách `SystemMessage` và `HumanMessage` nhằm phân biệt rõ ràng giữa **chỉ dẫn cố định của hệ thống** (quy định hành vi, vai trò) và **dữ liệu đầu vào của người dùng**, tăng tính nhất quán và bảo mật (chống prompt injection).
+* **Tool binding:** Decorator `@tool` biến các hàm Python thông thường thành định dạng schema (JSON) mô tả tham số của tool cho LLM. LLM tự ra quyết định gọi tool thủ công và trả về `tool_calls`. Ở Stage 2, luồng này được lặp thủ công thông qua một vòng lặp `for tc in response.tool_calls` để tự gọi hàm và append `ToolMessage` vào danh sách.
+
+#### B. Sửa lỗi & Tối ưu Single Agent (Stage 3)
+* Đã cấu hình tham số `debug=True` cho `create_react_agent` tại file `stages/stage_3_single_agent/main.py` để in chi tiết các bước THINK -> ACT -> OBSERVE.
+* Kết quả test chạy mượt mà, hiển thị toàn bộ log trạng thái của từng bước gọi tool của agent.
+
+#### C. Thêm Agent & Sửa lỗi Multi-Agent (Stage 4)
+* **Sửa lỗi đồ thị:** Đã sửa hàm `check_routing` (đóng vai trò là một Node) trả về `dict` cập nhật State thay vì trả về danh sách `Send` trực tiếp. Logic định tuyến `Send` được chuyển sang hàm điều hướng `route_to_specialists` (Conditional Edge).
+* **Bổ dung Privacy Agent:** Thêm node `privacy_agent` xử lý song song với Tax và Compliance. Khai báo các biến `needs_privacy` và `privacy_result` trong State và hàm `aggregate` để gom câu trả lời hoàn chỉnh.
+* **Vẽ đồ thị:** Đã sửa lỗi NameError do vẽ đồ thị ngoài hàm `main`, đồng thời chuyển đổi việc vẽ đồ thị sang xuất file ảnh `graph.png` tại [stages/stage_4_milti_agent/graph.png](stages/stage_4_milti_agent/graph.png).
+
+#### D. Kiểm thử Dynamic Discovery & Fault Tolerance (Bài tập 5.2 & 5.3)
+* **Dynamic Discovery Fault Tolerance:** Khi tắt `tax_agent` (cổng 10102) và chạy test, cuộc gọi A2A delegate từ `law_agent` ném ra lỗi `httpx.ConnectError`. Đồ thị của `law_agent` đã bắt lỗi này một cách an toàn (`try-except`) và trả về chuỗi thông báo lỗi thế mạng làm kết quả phân tích thuế. Hệ thống vẫn tiếp tục chạy và hoàn tất cuộc gọi thành công (Graceful Degradation).
+* **Thay đổi hành vi Agent (Bài tập 5.3):** Sửa đổi prompt của `tax_agent` để thu gọn câu trả lời dưới 100 từ, sau khi khởi động lại, kết quả phân tích thuế trong báo cáo cuối cùng đã ngắn gọn và súc tích hơn đáng kể.
+
+#### E. Trace Request Flow (Stage 5)
+Theo dõi hành trình xử lý của một request thành công qua ID trace `d77cfd78-9a53-4063-b648-afb0aa2afbf1`:
+* **Customer Agent (10100)** tiếp nhận yêu cầu -> Gọi Registry phát hiện `law_agent` -> Gọi A2A sang **Law Agent (10101)**.
+* **Law Agent** xử lý -> Phân tích định tuyến thấy cần Tax & Compliance -> Gọi Registry tìm kiếm `tax_agent` (10102) và `compliance_agent` (10103) -> Gửi request song song qua A2A delegate.
+* **Tax & Compliance Agents** chạy độc lập trên LLM và trả kết quả về cho **Law Agent**.
+* **Law Agent** chạy bước `aggregate` -> Trả kết quả cuối cùng về cho **Customer Agent** -> Trả về kết quả hoàn thiện cho Client.
+
+Sơ đồ trình tự (Sequence Diagram) minh họa luồng gọi A2A:
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant CA as Customer Agent (10100)
+    participant Reg as Registry (10000)
+    participant LA as Law Agent (10101)
+    participant TA as Tax Agent (10102)
+    participant Comp as Compliance Agent (10103)
+
+    Client->>CA: Gửi câu hỏi pháp lý
+    activate CA
+    CA->>Reg: discover("legal_question")
+    Reg-->>CA: Trả về endpoint Law Agent (10101)
+    CA->>LA: delegate(câu hỏi, context_id, trace_id, depth=1)
+    activate LA
+
+    Note over LA: analyze_law node:<br/>Phân tích hợp đồng/tổn thất
+    Note over LA: check_routing node:<br/>Quyết định cần Tax & Compliance
+
+    par Uỷ quyền song song (A2A)
+        LA->>Reg: discover("tax_question")
+        Reg-->>LA: Trả về endpoint Tax Agent (10102)
+        LA->>TA: delegate(câu hỏi, context_id, trace_id, depth=2)
+        activate TA
+        Note over TA: Phân tích thuế
+        TA-->>LA: Trả về kết quả phân tích thuế
+        deactivate TA
+    and
+        LA->>Reg: discover("compliance_question")
+        Reg-->>LA: Trả về endpoint Compliance Agent (10103)
+        LA->>Comp: delegate(câu hỏi, context_id, trace_id, depth=2)
+        activate Comp
+        Note over Comp: Phân tích compliance
+        Comp-->>LA: Trả về kết quả compliance
+        deactivate Comp
+    end
+
+    Note over LA: aggregate node:<br/>Tổng hợp toàn bộ phân tích
+
+    LA-->>CA: Trả về kết quả tổng hợp
+    deactivate LA
+    CA-->>Client: Trả về câu trả lời hoàn chỉnh
+    deactivate CA
+```
+
+---
+
+### 3. Báo cáo Bài tập Nâng cao (Challenge 3: Tự động retry với Exponential Backoff)
+
+Để nâng cao tính ổn định và chống chịu lỗi trong môi trường phân tán nơi các Agent độc lập giao tiếp qua mạng HTTP, chúng tôi đã triển khai thành công tính năng tự động thử lại với Exponential Backoff và Jitter tại [common/a2a_client.py](file:///home/winie/2A202600723-NguyenThiVang-Day9_Multi-Agent_MCP-A2A/common/a2a_client.py#L30-L112).
+
+#### Cơ chế hoạt động:
+1. **Retry Loop:** Mọi cuộc gọi ủy quyền `delegate()` qua A2A SDK được bọc trong một vòng lặp thử lại tối đa là **3 lần** (`max_retries = 3`).
+2. **Exponential Backoff:** Khi cuộc gọi HTTP (lấy thông tin Agent Card hoặc gửi tin nhắn) gặp lỗi, thời gian chờ để thử lại tiếp theo tăng theo cấp số nhân: `delay = initial_delay * (backoff_factor ** (attempt - 1))`.
+   - Lần 1 thất bại: chờ ~1 giây
+   - Lần 2 thất bại: chờ ~2 giây
+3. **Jitter:** Cộng thêm một lượng thời gian ngẫu nhiên nhỏ (`random.uniform(0.1, 0.5)`) vào mỗi chu kỳ chờ để tránh hiện tượng thăng hoa/đồng bộ yêu cầu (thundering herd) khi nhiều Agent cùng gọi dịch vụ bị lỗi cùng lúc.
+4. **Error Handling:** Log đầy đủ thông tin lỗi ở dạng `WARNING` khi xảy ra lỗi tạm thời, và chỉ ném lỗi `Exception` dạng `ERROR` ra ngoài khi toàn bộ 3 lần thử lại đều thất bại, giúp hệ thống phục hồi tự động khi gặp sự cố mạng hoặc khởi động trễ của các Agent.
+
+---
+
+### 4. Đáp án Câu hỏi Ôn tập (Codelab Review Questions)
+
+#### Câu 1: Khi nào nên dùng single agent thay vì multi-agent?
+* **Single Agent:** Nên dùng khi tác vụ đơn giản, nằm trong một phạm vi kiến thức hẹp, không cần phân công chuyên môn sâu, hoặc khi yêu cầu khắt khe về mặt latency (giảm thiểu độ trễ giao tiếp giữa các agent).
+* **Multi-Agent:** Phù hợp với các hệ thống lớn, yêu cầu kết hợp nhiều kỹ năng/lĩnh vực chuyên biệt (ví dụ: Pháp lý, Thuế, và Tuân thủ Luật pháp) chạy song song, hoặc khi muốn module hóa hệ thống để dễ nâng cấp, debug độc lập.
+
+#### Câu 2: Ưu điểm của A2A protocol so với gRPC hoặc REST thông thường?
+* A2A protocol định nghĩa một tầng giao thức chuẩn hóa dành riêng cho giao tiếp của các AI Agent, tự động tích hợp metadata cần thiết như `context_id`, `trace_id` giúp theo dõi dấu vết cuộc gọi đệ quy (observability/tracing).
+* Giao thức A2A cho phép truyền tải mô tả năng lực của Agent (Agent Cards) và các cấu trúc hội thoại linh hoạt, giúp các Agent dễ dàng tự khám phá và giao tiếp với nhau mà không cần thỏa thuận schema REST/gRPC thủ công cứng nhắc cho từng cặp kết nối.
+
+#### Câu 3: Làm thế nào để prevent infinite delegation loops trong A2A?
+* Sử dụng một thuộc tính chỉ số độ sâu `delegation_depth` truyền trong metadata của tin nhắn.
+* Mỗi khi một Agent thực hiện ủy quyền (delegate) cuộc gọi sang một Agent khác, chỉ số `delegation_depth` sẽ tăng lên 1 đơn vị.
+* Quy định một giới hạn độ sâu tối đa `MAX_DELEGATION_DEPTH` (ví dụ: = 3). Khi một Agent nhận được một yêu cầu có `delegation_depth` vượt quá giới hạn này, nó sẽ từ chối ủy quyền thêm và trả về phản hồi lỗi hoặc câu trả lời cục bộ ngay lập tức.
+
+#### Câu 4: Tại sao cần Registry service? Có thể hardcode URLs không?
+* Registry service đóng vai trò làm trung tâm Service Discovery. Nó giúp quản lý danh sách Agent và năng lực (tasks) của họ một cách động.
+* Không nên hardcode URLs vì trong môi trường sản xuất thực tế, các dịch vụ Agent có thể được triển khai trên các máy chủ khác nhau, thay đổi địa chỉ IP hoặc port, hoặc tự động co giãn (scaling). Việc sử dụng Registry giúp hệ thống hoạt động linh hoạt, tự động phát hiện các Agent mới và tăng khả năng chịu lỗi khi một Agent cụ thể thay đổi địa chỉ.
+
+---
+
+### 5. Bài Tập Cộng Điểm: Phân tích Latency & Tối ưu hóa
+
+#### Đo lường Latency ban đầu:
+* Khi chạy Stage 5 mặc định với mô hình `google/gemma-4-26b-a4b-it` trên OpenRouter, hệ thống bị nghẽn trầm trọng và rơi vào trạng thái **Timeout (>300 giây)** do mô hình phản hồi quá chậm và không giới hạn token tối đa dẫn đến lỗi `402 Payment Required` (hết số dư hoặc tính phí cao ước tính).
+
+#### Phương án tối ưu hóa:
+1. **Thay đổi mô hình LLM:** Cấu hình biến `OPENROUTER_MODEL=google/gemini-2.5-flash` trong file `.env` giúp phản hồi nhanh vượt trội và tiết kiệm tài nguyên.
+2. **Giới hạn tokens tối đa:** Thêm `max_tokens=2000` vào cấu hình khởi tạo của `ChatOpenAI` tại file `common/llm.py` để ngăn chặn việc LLM sinh chuỗi văn bản quá dài và giải quyết dứt điểm lỗi `402 Payment Required`.
+
+#### Kết quả sau khi tối ưu:
+* Thời gian xử lý cho toàn bộ chuỗi A2A Multi-Agent phức tạp giảm chỉ còn **~47.05 giây** (bao gồm việc gọi song song qua A2A của Tax Agent và Compliance Agent từ Law Agent).
+* Hệ thống hoạt động trơn tru 100%, phản hồi chính xác và cấu trúc báo cáo rất chi tiết.

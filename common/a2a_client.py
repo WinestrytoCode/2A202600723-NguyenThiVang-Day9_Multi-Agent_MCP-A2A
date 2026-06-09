@@ -6,7 +6,9 @@ sends a message to another A2A agent and returns the text response.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from uuid import uuid4
 
 import httpx
@@ -34,6 +36,8 @@ async def delegate(
 ) -> str:
     """Send a question to an A2A agent and return the text response.
 
+    Uses exponential backoff retry logic to handle transient errors.
+
     Args:
         endpoint: Base URL of the target agent (e.g. "http://localhost:10101").
         question: The question to ask.
@@ -44,42 +48,67 @@ async def delegate(
     Returns:
         The agent's text response, or an empty string if none could be extracted.
     """
-    async with httpx.AsyncClient(timeout=300.0) as http_client:
-        # Fetch agent card
-        card_url = f"{endpoint}/.well-known/agent.json"
-        card_resp = await http_client.get(card_url)
-        card_resp.raise_for_status()
-        agent_card = AgentCard.model_validate(card_resp.json())
+    max_retries = 3
+    initial_delay = 1.0
+    backoff_factor = 2.0
 
-        # Build deprecated (legacy) A2AClient — straightforward for send_message
-        client = A2AClient(httpx_client=http_client, agent_card=agent_card)
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as http_client:
+                # Fetch agent card
+                card_url = f"{endpoint}/.well-known/agent.json"
+                card_resp = await http_client.get(card_url)
+                card_resp.raise_for_status()
+                agent_card = AgentCard.model_validate(card_resp.json())
 
-        # Build message with trace metadata
-        message = Message(
-            role=Role.user,
-            parts=[Part(root=TextPart(text=question))],
-            message_id=str(uuid4()),
-            context_id=context_id,
-            metadata={
-                "trace_id": trace_id,
-                "context_id": context_id,
-                "delegation_depth": depth,
-            },
-        )
+                # Build deprecated (legacy) A2AClient — straightforward for send_message
+                client = A2AClient(httpx_client=http_client, agent_card=agent_card)
 
-        request = SendMessageRequest(
-            id=str(uuid4()),
-            params=MessageSendParams(message=message),
-        )
+                # Build message with trace metadata
+                message = Message(
+                    role=Role.user,
+                    parts=[Part(root=TextPart(text=question))],
+                    message_id=str(uuid4()),
+                    context_id=context_id,
+                    metadata={
+                        "trace_id": trace_id,
+                        "context_id": context_id,
+                        "delegation_depth": depth,
+                    },
+                )
 
-        logger.debug(
-            "Delegating to %s (depth=%d, trace=%s)", endpoint, depth, trace_id
-        )
+                request = SendMessageRequest(
+                    id=str(uuid4()),
+                    params=MessageSendParams(message=message),
+                )
 
-        response = await client.send_message(request)
+                logger.debug(
+                    "Delegating to %s (attempt %d/%d, depth=%d, trace=%s)", 
+                    endpoint, attempt, max_retries, depth, trace_id
+                )
 
-        # Extract text from SendMessageResponse
-        return _extract_text(response)
+                response = await client.send_message(request)
+
+                # Extract text from SendMessageResponse
+                return _extract_text(response)
+        except Exception as exc:
+            if attempt == max_retries:
+                logger.error(
+                    "Delegation to %s failed after %d attempts: %s", 
+                    endpoint, max_retries, exc
+                )
+                raise exc
+            
+            # Calculate backoff with jitter
+            delay = initial_delay * (backoff_factor ** (attempt - 1))
+            jitter = random.uniform(0.1, 0.5)
+            sleep_time = delay + jitter
+            
+            logger.warning(
+                "Delegation to %s failed (attempt %d/%d): %s. Retrying in %.2fs...",
+                endpoint, attempt, max_retries, exc, sleep_time
+            )
+            await asyncio.sleep(sleep_time)
 
 
 def _extract_text(response: object) -> str:
